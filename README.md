@@ -13,8 +13,9 @@ Helps you come back to learning consistently, even when the questions are hard:
 - **Feedback guidance in lessons.** The tutor is told to name what was right in your
   reasoning before correcting the rest, to say plainly that misses on hard questions are
   expected, and to point out that confidently held mistakes are corrected especially
-  well. The tutor is not told about your streak. During the assessment
-  (probe) phase it only says, once, that missed questions are expected. This works
+  well. The tutor is not told your streak; on a day you reach a milestone it only
+  receives the milestone's ID (for example `run-7`) so it can show the card. During the
+  assessment (probe) phase the guidance is just one line: missed questions are expected. This works
   within LearnHarness's own voice rules (no praise, wrong answers named plainly), which
   match the research: specific feedback about the task beats praise. Celebration lives
   in the plugin's UI instead: the streak flame in the sidebar and lesson top bar, and
@@ -61,17 +62,22 @@ touched. Restart LearnHarness to load the update; **Roll back to previous versio
 restores the earlier copy. If an update stops the plugin from loading, close
 LearnHarness and rename `gamification/dist.previous` back to `gamification/dist`.
 
+Plugins cannot read LearnHarness's version. If an update needs a newer LearnHarness than
+the installed plugin did, you are asked to confirm you have it before it installs; an
+older app could not load it.
+
 Updates only work when the GitHub repository is public: the plugin downloads releases
-without signing in. Developer installs (a plugin folder containing `package.json`, `src`
-or `.git`) never self-update.
+without signing in. Development builds never self-update: builds installed with
+`npm run install:local` are marked as such, and so is a plugin folder containing
+`package.json`, `src` or `.git`.
 
 ## Data
 
 In the plugin's `data/` folder: `state.json` (dates of learning events, whether a
 question was challenging or a confident mistake, a short question excerpt, milestones,
 settings, your study plan) and `study-reminder.ics`. Your written thinking is never
-stored. If you delete a session, its learning days still count but its excerpts are
-removed. The plugin only reads your sessions; it never changes them.
+stored, and neither are session titles. If you delete a session, its learning days
+still count but its excerpts are removed. The plugin only reads your sessions; it never changes them.
 
 ## Settings
 
@@ -107,5 +113,9 @@ npm run install:local -- ../../learnharness/data/plugins   # then restart LearnH
 4. Publish them: `gh release create v<version> -R All-Light/learnharness-gamification release/*`.
 
 ## License
+
+Third-party code bundled into the plugin is listed with its license in `dist/licenses/`
+(fflate, MIT).
+
 
 AGPL-3.0-only, the same license as LearnHarness. See [LICENSE](LICENSE).

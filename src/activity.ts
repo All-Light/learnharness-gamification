@@ -33,17 +33,18 @@ function excerpt(text: unknown): string | undefined {
   if (typeof text !== "string") return undefined;
   const clean = text.replace(/\s+/g, " ").trim();
   if (!clean) return undefined;
-  return clean.length > EXCERPT_CHARS
-    ? `${clean.slice(0, EXCERPT_CHARS - 1)}…`
-    : clean;
+  const chars = Array.from(clean); // whole characters, never half a surrogate pair
+  return chars.length > EXCERPT_CHARS ? `${chars.slice(0, EXCERPT_CHARS - 1).join("")}…` : clean;
 }
 
+/** Timestamps outside this range are treated as invalid (bad clocks, corrupt records). */
+const EARLIEST = Date.UTC(2000, 0, 1);
+const LATEST = Date.UTC(2100, 0, 1);
+
 function isoFromTimestamp(value: unknown): string | undefined {
-  if (typeof value === "number" && Number.isFinite(value))
-    return new Date(value).toISOString();
-  if (typeof value === "string" && !Number.isNaN(Date.parse(value)))
-    return new Date(value).toISOString();
-  return undefined;
+  const ms = typeof value === "number" ? value : typeof value === "string" ? Date.parse(value) : NaN;
+  if (!Number.isFinite(ms) || ms < EARLIEST || ms >= LATEST) return undefined;
+  return new Date(ms).toISOString();
 }
 
 /** Extract learning events from one session record (unknown shapes are skipped). */

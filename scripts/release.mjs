@@ -7,7 +7,7 @@
  * Upload all three to the release. Options:
  *   --notes "text"   release notes shown in the update prompt
  *   --unsigned       only build the zip (local testing; not installable as an update)
- * The signing key is read from CANVAS_PLUGIN_SIGNING_KEY or
+ * The signing key is read from GAMIFICATION_PLUGIN_SIGNING_KEY or
  * ~/.config/learnharness-gamification/signing-key.pem (create it with npm run keygen).
  */
 import crypto from "node:crypto";
@@ -27,6 +27,8 @@ const notes = notesIndex >= 0 ? (args[notesIndex + 1] ?? "") : "";
 const manifest = JSON.parse(
   fs.readFileSync(path.join(dist, "manifest.json"), "utf8"),
 );
+if (fs.existsSync(path.join(dist, "dev-build.json")))
+  throw new Error("dist/ is a development build; run npm run release (it rebuilds) instead");
 if (fs.existsSync(path.join(dist, "data")))
   throw new Error("Refusing to package dist/data");
 
@@ -55,7 +57,7 @@ console.log(
 if (unsigned) process.exit(0);
 
 const keyPath =
-  process.env.CANVAS_PLUGIN_SIGNING_KEY ??
+  process.env.GAMIFICATION_PLUGIN_SIGNING_KEY ??
   path.join(
     os.homedir(),
     ".config",

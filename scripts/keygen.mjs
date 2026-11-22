@@ -1,7 +1,7 @@
 /**
  * One-time: create the Ed25519 release signing key.
  *   - private key -> ~/.config/learnharness-gamification/signing-key.pem (owner-only,
- *     outside the repo; override with CANVAS_PLUGIN_SIGNING_KEY)
+ *     outside the repo; override with GAMIFICATION_PLUGIN_SIGNING_KEY)
  *   - public key  -> src/update-key.ts (built into the plugin)
  * Refuses to overwrite an existing private key: replacing it means every
  * installed copy rejects future updates until people reinstall manually.
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const keyPath =
-  process.env.CANVAS_PLUGIN_SIGNING_KEY ??
+  process.env.GAMIFICATION_PLUGIN_SIGNING_KEY ??
   path.join(
     os.homedir(),
     ".config",

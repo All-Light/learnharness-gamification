@@ -18,7 +18,6 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 export interface SessionEntry {
-  title: string;
   /** Message count when last scanned; unchanged sessions are not re-read. */
   messageCount: number;
   events: LearningEvent[];
@@ -35,6 +34,8 @@ export interface State {
   /** Milestone IDs the tutor has shown as a card. */
   delivered: string[];
   plan?: StudyPlan;
+  /** Stable calendar event ID for the study reminder. */
+  reminderUid?: string;
 }
 
 const FILE = "state.json";
@@ -56,6 +57,8 @@ export async function loadState(dir: string): Promise<State> {
       throw new Error(
         "Unsupported Gamification state version; refusing to overwrite it.",
       );
+    // Earlier versions stored session titles; they are not needed, so drop them.
+    for (const entry of Object.values(raw.sessions ?? {}) as Record<string, unknown>[]) delete entry.title;
     return {
       ...emptyState(),
       ...raw,
@@ -67,17 +70,26 @@ export async function loadState(dir: string): Promise<State> {
   }
 }
 
-export async function saveState(dir: string, state: State): Promise<void> {
+/**
+ * Write an owner-only file atomically (temporary file, then rename). The
+ * rename replaces a symlink at the destination rather than following it.
+ */
+export async function writePrivateFile(dir: string, name: string, data: string): Promise<string> {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, FILE);
+  const file = path.join(dir, name);
   const temp = `${file}.tmp-${crypto.randomUUID()}`;
   try {
-    await fs.writeFile(temp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    await fs.writeFile(temp, data, { mode: 0o600, flag: "wx" });
     await fs.rename(temp, file);
   } catch (error) {
     await fs.rm(temp, { force: true }).catch(() => {});
     throw error;
   }
+  return file;
+}
+
+export async function saveState(dir: string, state: State): Promise<void> {
+  await writePrivateFile(dir, FILE, JSON.stringify(state, null, 2));
 }
 
 export function validateSettings(raw: unknown): Settings {
@@ -102,7 +114,6 @@ export function validateSettings(raw: unknown): Settings {
 
 export interface DatedEvent extends LearningEvent {
   date: string;
-  sessionTitle: string;
 }
 
 export function allEvents(state: State, timeZone?: string): DatedEvent[] {
@@ -113,7 +124,6 @@ export function allEvents(state: State, timeZone?: string): DatedEvent[] {
         ...e,
         ...(entry.deleted ? { excerpt: undefined } : {}),
         date: localDate(e.at, timeZone),
-        sessionTitle: entry.deleted ? "" : entry.title,
       });
   return out.sort((a, b) => a.at.localeCompare(b.at));
 }

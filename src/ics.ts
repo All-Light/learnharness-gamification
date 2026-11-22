@@ -78,7 +78,11 @@ function firstDate(from: Date, days: Weekday[]): string {
   throw new Error("No matching day.");
 }
 
-export function buildIcs(plan: StudyPlan, now = new Date()): string {
+export function buildIcs(
+  plan: StudyPlan,
+  now = new Date(),
+  uid = `${crypto.randomUUID()}@learnharness-gamification`,
+): string {
   const [hh, mm] = plan.time.split(":");
   const stamp = now
     .toISOString()
@@ -91,7 +95,7 @@ export function buildIcs(plan: StudyPlan, now = new Date()): string {
     "PRODID:-//learnharness-gamification//study reminder//EN",
     "CALSCALE:GREGORIAN",
     "BEGIN:VEVENT",
-    `UID:${crypto.randomUUID()}@learnharness-gamification`,
+    `UID:${escapeText(uid)}`,
     `DTSTAMP:${stamp}`,
     `DTSTART:${firstDate(now, plan.days)}T${hh}${mm}00`,
     `DURATION:PT${plan.minutes}M`,

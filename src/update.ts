@@ -47,6 +47,12 @@ export interface UpdateStatus {
   canRollBack: boolean;
   /** An update or rollback was applied; restart LearnHarness to load it. */
   restartRequired: boolean;
+  /**
+   * The available release needs a newer LearnHarness than this version of the
+   * plugin did. Plugins cannot read the app version, so installing it needs
+   * the user to confirm they have it (otherwise the app could not load it).
+   */
+  needsAppConfirm?: boolean;
 }
 
 export function parseVersion(v: string): [number, number, number] | undefined {
@@ -177,16 +183,22 @@ export interface UpdaterOptions {
   directory: string;
   /** Writable plugin data directory (ctx.dataDirectory). */
   dataDirectory: string;
+  /** Version of the running plugin (ctx.manifest.version). */
   currentVersion: string;
+  /** minAppVersion of the running plugin (ctx.manifest.minAppVersion). */
+  currentMinAppVersion?: string;
   fetchImpl?: FetchLike;
   publicKey?: string;
   now?: () => number;
 }
 
+/** Written into dist/ by development builds (npm run install:local); never in releases. */
+export const DEV_BUILD_MARKER = "dev-build.json";
+
 export class Updater {
   private readonly root: string;
   private readonly fetchImpl: FetchLike;
-  private restartRequired = false;
+  /** Install and rollback share one lock. */
   private busy = false;
 
   constructor(private readonly options: UpdaterOptions) {
@@ -199,161 +211,183 @@ export class Updater {
   }
 
   /**
-   * Self-update only manages a plain community install (<plugins>/gamification/dist).
-   * A source checkout is updated with git; an app-bundled copy by the app.
+   * Self-update only manages a plain community install (<plugins>/gamification/dist)
+   * of a release build. Source checkouts and development builds are updated by
+   * rebuilding; an app-bundled copy by the app.
    */
   async mode(): Promise<UpdateStatus["mode"]> {
     if (path.basename(this.options.directory) !== "dist") return "managed";
     for (const marker of ["package.json", ".git", "src"])
       if (await exists(path.join(this.root, marker))) return "developer";
+    if (await exists(path.join(this.options.directory, DEV_BUILD_MARKER))) return "developer";
     return "updatable";
   }
 
-  private async readState(): Promise<{
-    checkedAt?: string;
-    latest?: ReleaseInfo;
-    error?: string;
-  }> {
+  /**
+   * The version now in dist/ differs from the running one: an update or
+   * rollback was applied and LearnHarness has not been restarted yet. Read
+   * from disk so it survives reloads and new Updater instances.
+   */
+  private async restartPending(): Promise<boolean> {
     try {
-      return JSON.parse(
-        await fs.readFile(
-          path.join(this.options.dataDirectory, STATE_FILE),
-          "utf8",
-        ),
-      );
+      const onDisk = JSON.parse(await fs.readFile(path.join(this.options.directory, "manifest.json"), "utf8"));
+      return onDisk?.version !== this.options.currentVersion;
+    } catch {
+      return false;
+    }
+  }
+
+  private async readState(): Promise<{ checkedAt?: string; latest?: ReleaseInfo; error?: string }> {
+    try {
+      return JSON.parse(await fs.readFile(path.join(this.options.dataDirectory, STATE_FILE), "utf8"));
     } catch {
       return {};
     }
   }
 
-  private async writeState(state: {
-    checkedAt: string;
-    latest?: ReleaseInfo;
-    error?: string;
-  }) {
-    await fs.mkdir(this.options.dataDirectory, { recursive: true });
-    await fs.writeFile(
-      path.join(this.options.dataDirectory, STATE_FILE),
-      JSON.stringify(state, null, 2),
-      { mode: 0o600 },
-    );
+  private async writeState(state: { checkedAt?: string; latest?: ReleaseInfo; error?: string }) {
+    await fs.mkdir(this.options.dataDirectory, { recursive: true, mode: 0o700 });
+    const file = path.join(this.options.dataDirectory, STATE_FILE);
+    const temp = `${file}.tmp-${crypto.randomUUID()}`;
+    try {
+      await fs.writeFile(temp, JSON.stringify(state, null, 2), { mode: 0o600, flag: "wx" });
+      await fs.rename(temp, file);
+    } catch (error) {
+      await fs.rm(temp, { force: true }).catch(() => {});
+      throw error;
+    }
+  }
+
+  /** Remove staging folders left behind by a crash. */
+  private async cleanLeftovers(): Promise<void> {
+    if (this.busy) return;
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(this.root);
+    } catch {
+      return;
+    }
+    for (const name of entries)
+      if (/^\.(update|rollback)-[0-9a-f-]{36}$/.test(name))
+        await fs.rm(path.join(this.root, name), { recursive: true, force: true }).catch(() => {});
   }
 
   private async fetchRelease(signal?: AbortSignal): Promise<ReleaseInfo> {
-    const feed = await fetchAsset(
-      this.fetchImpl,
-      "latest.json",
-      MAX_FEED_BYTES,
-      signal,
-    );
-    const sig = await fetchAsset(
-      this.fetchImpl,
-      "latest.json.sig",
-      MAX_SIG_BYTES,
-      signal,
-    );
+    const feed = await fetchAsset(this.fetchImpl, "latest.json", MAX_FEED_BYTES, signal);
+    const sig = await fetchAsset(this.fetchImpl, "latest.json.sig", MAX_SIG_BYTES, signal);
     return verifyFeed(feed, sig.toString("utf8"), this.publicKey);
   }
 
-  /** Status, checking GitHub if `force` or the last check is over a day old. */
+  private needsAppConfirm(release: ReleaseInfo): boolean {
+    const known = this.options.currentMinAppVersion;
+    return !known || isNewer(release.minAppVersion, known);
+  }
+
+  /**
+   * Status, checking GitHub if `force` or the last successful check is over a
+   * day old. A failed check is reported but does not delay the next one.
+   */
   async status(force = false, signal?: AbortSignal): Promise<UpdateStatus> {
     const mode = await this.mode();
     const current = this.options.currentVersion;
+    const restartRequired = mode === "updatable" && (await this.restartPending());
     const base = {
       mode,
       current,
-      canRollBack:
-        mode === "updatable" &&
-        (await exists(path.join(this.root, "dist.previous", "manifest.json"))),
-      restartRequired: this.restartRequired,
+      canRollBack: mode === "updatable" && (await exists(path.join(this.root, "dist.previous", "manifest.json"))),
+      restartRequired,
     };
     if (mode !== "updatable") return { ...base, available: false };
+    await this.cleanLeftovers();
     let state = await this.readState();
     const now = (this.options.now ?? Date.now)();
-    const stale =
-      !state.checkedAt || now - Date.parse(state.checkedAt) > CHECK_INTERVAL_MS;
+    const stale = !state.checkedAt || now - Date.parse(state.checkedAt) > CHECK_INTERVAL_MS;
     if (force || stale) {
       try {
         const latest = await this.fetchRelease(signal);
         state = { checkedAt: new Date(now).toISOString(), latest };
       } catch (error) {
+        // Keep the last successful check time so the next open retries.
         state = {
-          checkedAt: new Date(now).toISOString(),
+          ...(state.checkedAt ? { checkedAt: state.checkedAt } : {}),
+          ...(state.latest ? { latest: state.latest } : {}),
           error: (error as Error).message,
         };
       }
-      await this.writeState(state as { checkedAt: string });
+      await this.writeState(state);
     }
     const latest = state.latest;
+    const available = !!latest && isNewer(latest.version, current);
     return {
       ...base,
       ...(latest ? { latest } : {}),
       ...(state.checkedAt ? { checkedAt: state.checkedAt } : {}),
       ...(state.error ? { error: state.error } : {}),
-      available: !!latest && isNewer(latest.version, current),
+      available,
+      ...(available && latest && this.needsAppConfirm(latest) ? { needsAppConfirm: true } : {}),
     };
   }
 
-  /** Download, verify and install the latest release. Restart to load it. */
-  async install(signal?: AbortSignal): Promise<UpdateStatus> {
-    if ((await this.mode()) !== "updatable")
-      throw new Error("Updates for this install are managed elsewhere.");
+  private async exclusive<T>(work: () => Promise<T>): Promise<T> {
+    // Take the lock synchronously, before any await, so two calls cannot both pass.
     if (this.busy) throw new Error("An update is already in progress.");
     this.busy = true;
-    const staging = path.join(this.root, `.update-${crypto.randomUUID()}`);
     try {
-      // Re-fetch and re-verify; never trust the cached check for installing.
-      const release = await this.fetchRelease(signal);
-      if (!isNewer(release.version, this.options.currentVersion))
-        throw new Error("No newer version is available.");
-      const zip = await fetchAsset(
-        this.fetchImpl,
-        release.zip.name,
-        release.zip.size,
-        signal,
-      );
-      if (
-        zip.length !== release.zip.size ||
-        crypto.createHash("sha256").update(zip).digest("hex") !==
-          release.zip.sha256
-      )
-        throw new Error(
-          "The downloaded update does not match its signed checksum. Not installing it.",
-        );
-      const { files } = await extractZip(zip, staging);
-      if (files.some((f) => !f.startsWith(`${PLUGIN_ID}/dist/`)))
-        throw new Error("The update package has an unexpected layout.");
-      const newDist = path.join(staging, PLUGIN_ID, "dist");
-      const manifest = JSON.parse(
-        await fs.readFile(path.join(newDist, "manifest.json"), "utf8"),
-      );
-      if (manifest?.id !== PLUGIN_ID || manifest?.version !== release.version)
-        throw new Error(
-          "The update package's manifest does not match the release.",
-        );
-      for (const entry of [manifest.main, manifest.backend, manifest.styles])
-        if (entry && !(await exists(path.join(newDist, String(entry)))))
-          throw new Error(`The update package is missing ${entry}.`);
-      await this.swapIn(newDist);
-      this.restartRequired = true;
-      return this.status(false, signal);
+      if ((await this.mode()) !== "updatable") throw new Error("Updates for this install are managed elsewhere.");
+      if (await this.restartPending())
+        throw new Error("An update was already applied. Restart LearnHarness before changing it again.");
+      return await work();
     } finally {
       this.busy = false;
-      await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  /** Download, verify and install the latest release. Restart to load it. */
+  async install(signal?: AbortSignal, options: { confirmAppVersion?: boolean } = {}): Promise<UpdateStatus> {
+    await this.exclusive(async () => {
+      const staging = path.join(this.root, `.update-${crypto.randomUUID()}`);
+      try {
+        // Re-fetch and re-verify; never trust the cached check for installing.
+        const release = await this.fetchRelease(signal);
+        if (!isNewer(release.version, this.options.currentVersion)) throw new Error("No newer version is available.");
+        if (this.needsAppConfirm(release) && options.confirmAppVersion !== true)
+          throw new Error(`This update needs LearnHarness ${release.minAppVersion} or newer. Confirm that you have it to install.`);
+        const zip = await fetchAsset(this.fetchImpl, release.zip.name, release.zip.size, signal);
+        if (zip.length !== release.zip.size || crypto.createHash("sha256").update(zip).digest("hex") !== release.zip.sha256)
+          throw new Error("The downloaded update does not match its signed checksum. Not installing it.");
+        const { files, skipped } = await extractZip(zip, staging);
+        if (skipped.length) throw new Error("The update package contains entries that could not be unpacked safely.");
+        if (files.some((f) => !f.startsWith(`${PLUGIN_ID}/dist/`))) throw new Error("The update package has an unexpected layout.");
+        const newDist = path.join(staging, PLUGIN_ID, "dist");
+        if (await exists(path.join(newDist, DEV_BUILD_MARKER))) throw new Error("The update package is a development build.");
+        const manifest = JSON.parse(await fs.readFile(path.join(newDist, "manifest.json"), "utf8"));
+        if (manifest?.id !== PLUGIN_ID || manifest?.version !== release.version || manifest?.minAppVersion !== release.minAppVersion)
+          throw new Error("The update package's manifest does not match the release.");
+        for (const entry of [manifest.main, manifest.backend, manifest.styles])
+          if (entry && !(await exists(path.join(newDist, String(entry))))) throw new Error(`The update package is missing ${entry}.`);
+        await this.swapIn(newDist);
+      } finally {
+        await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+    return this.status(false, signal);
   }
 
   /** Restore the previous version (kept as dist.previous). Restart to load it. */
   async rollBack(): Promise<UpdateStatus> {
-    if ((await this.mode()) !== "updatable")
-      throw new Error("Updates for this install are managed elsewhere.");
-    const previous = path.join(this.root, "dist.previous");
-    if (!(await exists(path.join(previous, "manifest.json"))))
-      throw new Error("No previous version is available.");
-    const aside = path.join(this.root, `.rollback-${crypto.randomUUID()}`);
-    await fs.rename(previous, aside);
-    await this.swapIn(aside);
-    this.restartRequired = true;
+    await this.exclusive(async () => {
+      const previous = path.join(this.root, "dist.previous");
+      if (!(await exists(path.join(previous, "manifest.json")))) throw new Error("No previous version is available.");
+      const aside = path.join(this.root, `.rollback-${crypto.randomUUID()}`);
+      await fs.rename(previous, aside);
+      try {
+        await this.swapIn(aside);
+      } catch (error) {
+        // Put the previous version back where it was.
+        if (!(await exists(previous))) await fs.rename(aside, previous).catch(() => {});
+        throw error;
+      }
+    });
     return this.status();
   }
 
@@ -361,8 +395,7 @@ export class Updater {
   private async swapIn(replacement: string) {
     const dist = path.join(this.root, "dist");
     const previous = path.join(this.root, "dist.previous");
-    if (await exists(path.join(replacement, "data")))
-      throw new Error("Refusing a package that contains data/.");
+    if (await exists(path.join(replacement, "data"))) throw new Error("Refusing a package that contains data/.");
     await fs.rm(previous, { recursive: true, force: true });
     await fs.rename(dist, previous);
     try {

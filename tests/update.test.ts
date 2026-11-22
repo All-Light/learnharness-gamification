@@ -57,8 +57,8 @@ async function install(t: { after: (fn: () => Promise<void>) => void }, version 
   return root;
 }
 
-const updater = (root: string, fetchImpl: FetchLike, now = () => Date.now()) =>
-  new Updater({ directory: path.join(root, "dist"), dataDirectory: path.join(root, "data"), currentVersion: "0.2.0", fetchImpl, publicKey: PUBLIC, now });
+const updater = (root: string, fetchImpl: FetchLike, now = () => Date.now(), currentVersion = "0.2.0") =>
+  new Updater({ directory: path.join(root, "dist"), dataDirectory: path.join(root, "data"), currentVersion, currentMinAppVersion: "0.7.0", fetchImpl, publicKey: PUBLIC, now });
 
 test("version comparison", () => {
   assert.equal(isNewer("0.3.0", "0.2.0"), true);
@@ -113,7 +113,14 @@ test("install: verified update replaces dist, keeps data, allows rollback", asyn
   assert.equal(JSON.parse(await fs.readFile(path.join(root, "dist.previous", "manifest.json"), "utf8")).version, "0.2.0");
   assert.equal(await fs.readFile(path.join(root, "data", "state.json"), "utf8"), "secret");
   assert.deepEqual((await fs.readdir(root)).sort(), ["data", "dist", "dist.previous"], "no staging leftovers");
-  await u.rollBack();
+  // Nothing more can change until LearnHarness restarts (even with a new Updater).
+  await assert.rejects(u.rollBack(), /Restart LearnHarness/);
+  await assert.rejects(updater(root, github({})).install(), /Restart LearnHarness/);
+  assert.equal((await updater(root, github({})).status()).restartRequired, true);
+  // After the restart, 0.3.0 is running and can be rolled back.
+  const restarted = updater(root, github({ "latest.json": r.feed, "latest.json.sig": r.sig }), undefined, "0.3.0");
+  assert.equal((await restarted.status()).restartRequired, false);
+  await restarted.rollBack();
   assert.equal(JSON.parse(await fs.readFile(path.join(root, "dist", "manifest.json"), "utf8")).version, "0.2.0");
   assert.equal(JSON.parse(await fs.readFile(path.join(root, "dist.previous", "manifest.json"), "utf8")).version, "0.3.0");
 });
@@ -156,4 +163,73 @@ test("developer and app-managed installs never self-update", async (t) => {
   assert.equal(log.length, 0, "developer installs never contact GitHub");
   const managed = new Updater({ directory: root, dataDirectory: path.join(root, "data"), currentVersion: "0.2.0", fetchImpl: github({}), publicKey: PUBLIC });
   assert.equal((await managed.status()).mode, "managed");
+});
+
+test("a release needing a newer LearnHarness requires confirmation", async (t) => {
+  const zip = pluginZip("0.3.0");
+  // The manifest inside must match the release's minAppVersion.
+  const files = await import("fflate").then(({ unzipSync, zipSync }) => {
+    const entries = unzipSync(new Uint8Array(zip));
+    const m = JSON.parse(new TextDecoder().decode(entries["gamification/dist/manifest.json"]));
+    m.minAppVersion = "0.9.0";
+    entries["gamification/dist/manifest.json"] = strToU8(JSON.stringify(m));
+    return Buffer.from(zipSync(entries));
+  });
+  const r = release("0.3.0", files, privateKey, { minAppVersion: "0.9.0" });
+  const assets = { "latest.json": r.feed, "latest.json.sig": r.sig, "gamification-0.3.0.zip": r.zip };
+  const root = await install(t);
+  const status = await updater(root, github(assets)).status(true);
+  assert.equal(status.needsAppConfirm, true);
+  await assert.rejects(updater(root, github(assets)).install(), /needs LearnHarness 0\.9\.0/);
+  assert.equal(JSON.parse(await fs.readFile(path.join(root, "dist", "manifest.json"), "utf8")).version, "0.2.0");
+  await updater(root, github(assets)).install(undefined, { confirmAppVersion: true });
+  assert.equal(JSON.parse(await fs.readFile(path.join(root, "dist", "manifest.json"), "utf8")).version, "0.3.0");
+  // A release with the same minimum needs no confirmation.
+  const same = release("0.3.0", pluginZip("0.3.0"));
+  const root2 = await install(t);
+  assert.equal((await updater(root2, github({ "latest.json": same.feed, "latest.json.sig": same.sig })).status(true)).needsAppConfirm, undefined);
+});
+
+test("install and rollback share one lock; the known-good version is never lost", async (t) => {
+  const root = await install(t);
+  await fs.mkdir(path.join(root, "dist.previous"));
+  await fs.writeFile(path.join(root, "dist.previous", "manifest.json"), JSON.stringify({ id: "gamification", version: "0.1.0" }));
+  const r = release("0.3.0", pluginZip("0.3.0"));
+  const u = updater(root, github({ "latest.json": r.feed, "latest.json.sig": r.sig, "gamification-0.3.0.zip": r.zip }));
+  const results = await Promise.allSettled([u.install(), u.rollBack()]);
+  assert.equal(results.filter((x) => x.status === "fulfilled").length, 1, "exactly one of them runs");
+  const versions = await Promise.all(["dist", "dist.previous"].map(async (d) => JSON.parse(await fs.readFile(path.join(root, d, "manifest.json"), "utf8")).version));
+  assert.ok(versions.includes("0.2.0"), `0.2.0 must survive, got ${versions}`);
+});
+
+test("development builds and unsafe packages are never installed", async (t) => {
+  const root = await install(t);
+  await fs.writeFile(path.join(root, "dist", "dev-build.json"), "{}");
+  const log: string[] = [];
+  assert.equal((await updater(root, github({}, log)).status(true)).mode, "developer");
+  assert.equal(log.length, 0);
+  for (const [name, extra, error] of [
+    ["dev build inside", { "gamification/dist/dev-build.json": strToU8("{}") }, /development build/],
+    ["entry that cannot be unpacked safely", { "../outside.txt": strToU8("x") }, /could not be unpacked safely/],
+  ] as const) {
+    const zip = pluginZip("0.3.0", extra as Record<string, Uint8Array>);
+    const r = release("0.3.0", zip);
+    const target = await install(t);
+    await assert.rejects(updater(target, github({ "latest.json": r.feed, "latest.json.sig": r.sig, "gamification-0.3.0.zip": zip })).install(), error, name);
+    assert.equal(JSON.parse(await fs.readFile(path.join(target, "dist", "manifest.json"), "utf8")).version, "0.2.0", name);
+  }
+});
+
+test("a failed check does not delay the next one; crash leftovers are cleaned", async (t) => {
+  const root = await install(t);
+  await fs.mkdir(path.join(root, ".update-0b6c2f0e-8f7a-4d35-9a8e-1c2d3e4f5a6b"));
+  const log: string[] = [];
+  const u = updater(root, github({}, log));
+  const first = await u.status();
+  assert.match(first.error ?? "", /No published release/);
+  assert.equal(first.checkedAt, undefined);
+  const before = log.length;
+  await u.status();
+  assert.ok(log.length > before, "retried without force");
+  assert.deepEqual((await fs.readdir(root)).sort(), ["data", "dist"]);
 });

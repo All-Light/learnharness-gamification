@@ -1,3 +1,4 @@
+// From LearnHarness (https://github.com/amosblomqvist/learnharness), AGPL-3.0-only.
 /** Copy a built community package into an explicit plugins directory.
  * Portable: Node built-ins only. Run the project's build before this helper.
  * The host, not this helper, decides app compatibility and plugin enablement. */

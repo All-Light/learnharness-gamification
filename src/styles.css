@@ -171,3 +171,4 @@
 .lh-gam-notice { padding: 0.6rem 0.75rem; border: 1px solid color-mix(in oklab, var(--success, #2f855a) 55%, transparent); border-radius: 0.5rem; background: color-mix(in oklab, var(--success, #2f855a) 10%, transparent); }
 .lh-gam-notes { margin: 0.4rem 0 0; white-space: pre-wrap; color: var(--muted-foreground, color-mix(in oklab, var(--foreground) 60%, transparent)); }
 .lh-gam-attention { color: var(--warning, #b7791f); font-weight: 500; }
+.lh-gam-confirm { display: flex; gap: 0.4rem; align-items: flex-start; margin: 0.5rem 0; font-size: 0.8125rem; }

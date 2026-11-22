@@ -56,6 +56,13 @@ fs.copyFileSync(
 );
 fs.copyFileSync(path.join(root, "README.md"), path.join(output, "README.md"));
 fs.copyFileSync(path.join(root, "LICENSE"), path.join(output, "LICENSE"));
+// Third-party code bundled into backend.cjs: ship its license text (MIT requires it).
+fs.mkdirSync(path.join(output, "licenses"));
+fs.copyFileSync(path.join(root, "node_modules/fflate/LICENSE"), path.join(output, "licenses/fflate-LICENSE"));
+// Development builds (npm run install:local) are marked so the self-updater
+// never replaces them with a GitHub release. Release builds have no marker.
+if (process.argv.includes("--dev"))
+  fs.writeFileSync(path.join(output, "dev-build.json"), JSON.stringify({ builtAt: new Date().toISOString() }) + "\n");
 fs.copyFileSync(
   path.join(root, "src/styles.css"),
   path.join(output, "styles.css"),

@@ -1,5 +1,4 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+import crypto from "node:crypto";
 import type { PluginBackendContext } from "learnharness-plugin-api";
 import { extractEvents } from "./activity.ts";
 import { Updater } from "./update.ts";
@@ -15,6 +14,7 @@ import {
   recentWins,
   saveState,
   validateSettings,
+  writePrivateFile,
   type Settings,
   type State,
 } from "./state.ts";
@@ -71,44 +71,47 @@ export class Engine {
     return localDate(this.clock.now(), this.clock.timeZone);
   }
 
-  /** Re-read sessions whose message count changed (all, or one chat). */
+  /**
+   * Re-read sessions. With a chat ID only that session is read (the per-turn
+   * path, which must not touch the whole history); without one, sessions whose
+   * message count changed are re-read and deleted sessions are noticed.
+   * State is written only when something changed.
+   */
   async scan(chatId?: string): Promise<void> {
-    const listed = this.learning.listSessions();
-    const ids = new Set(listed.map((s) => s.id));
-    for (const s of listed) {
-      if (chatId && s.id !== chatId) continue;
-      const known = this.state.sessions[s.id];
-      if (
-        known &&
-        !known.deleted &&
-        s.messageCount !== undefined &&
-        known.messageCount === s.messageCount &&
-        !chatId
-      )
-        continue;
-      const record = this.learning.getSession(s.id);
-      if (!record) continue;
+    const before = JSON.stringify(this.state);
+    const seen: string[] = [];
+    const read = (id: string) => {
+      const record = this.learning.getSession(id);
+      if (!record) return;
       const messages = Array.isArray(record.messages) ? record.messages : [];
-      this.state.sessions[s.id] = {
-        title: s.title,
-        messageCount: messages.length,
-        events: extractEvents(record),
-      };
-      for (const id of deliveredMilestones(messages))
-        if (!this.state.delivered.includes(id)) this.state.delivered.push(id);
-    }
-    if (!chatId)
+      this.state.sessions[id] = { messageCount: messages.length, events: extractEvents(record) };
+      seen.push(...deliveredMilestones(messages));
+    };
+    if (chatId) read(chatId);
+    else {
+      const listed = this.learning.listSessions();
+      const ids = new Set(listed.map((s) => s.id));
+      for (const s of listed) {
+        const known = this.state.sessions[s.id];
+        if (known && !known.deleted && s.messageCount !== undefined && known.messageCount === s.messageCount) continue;
+        read(s.id);
+      }
       for (const [id, entry] of Object.entries(this.state.sessions))
         if (!ids.has(id) && !entry.deleted) {
           // Keep the learning days; drop the question excerpts of deleted sessions.
           entry.deleted = true;
-          entry.title = "";
-          entry.events = entry.events.map(
-            ({ excerpt: _drop, ...rest }) => rest,
-          );
+          entry.events = entry.events.map(({ excerpt: _drop, ...rest }) => rest);
         }
+    }
     this.updateMilestones();
-    await saveState(this.dataDir, this.state);
+    // Only milestones this plugin recorded count as delivered.
+    for (const id of seen)
+      if (this.isKnownMilestone(id) && !this.state.delivered.includes(id)) this.state.delivered.push(id);
+    if (JSON.stringify(this.state) !== before) await saveState(this.dataDir, this.state);
+  }
+
+  isKnownMilestone(id: string): boolean {
+    return this.state.reached.some((m) => m.id === id);
   }
 
   progress(): Progress {
@@ -181,9 +184,10 @@ export class Engine {
   /** Save the study plan and write the calendar file next to the plugin data. */
   async savePlan(raw: unknown): Promise<{ path: string; ics: string }> {
     const plan = validatePlan(raw);
-    const ics = buildIcs(plan, this.clock.now());
-    const file = path.join(this.dataDir, "study-reminder.ics");
-    await fs.writeFile(file, ics, { mode: 0o600 });
+    // A stable event ID, so re-importing an updated plan replaces the old event.
+    this.state.reminderUid ??= `${crypto.randomUUID()}@learnharness-gamification`;
+    const ics = buildIcs(plan, this.clock.now(), this.state.reminderUid);
+    const file = await writePrivateFile(this.dataDir, "study-reminder.ics", ics);
     this.state.plan = plan;
     await saveState(this.dataDir, this.state);
     return { path: file, ics };
@@ -196,29 +200,21 @@ export function activate(ctx: PluginBackendContext) {
     directory: ctx.directory,
     dataDirectory: ctx.dataDirectory,
     currentVersion: ctx.manifest.version,
+    currentMinAppVersion: ctx.manifest.minAppVersion,
   });
   ctx.handle("updateStatus", (input: any) => updater.status(input?.force === true, ctx.signal));
-  ctx.handle("installUpdate", () => updater.install(ctx.signal));
+  ctx.handle("installUpdate", (input: any) =>
+    updater.install(ctx.signal, { confirmAppVersion: input?.confirmAppVersion === true }),
+  );
   ctx.handle("rollBackUpdate", () => updater.rollBack());
 
-  const engine = new Engine(
-    ctx.dataDirectory,
-    ctx.learning as unknown as LearningReader,
-  );
+  const engine = new Engine(ctx.dataDirectory, ctx.learning as unknown as LearningReader);
   // One registration per audience; each is replaced only when its text changes.
-  const registered: Record<
-    keyof AgentInstructions,
-    { text?: string; off?: () => void }
-  > = {
+  const registered: Record<keyof AgentInstructions, { text?: string; off?: () => void }> = {
     teaching: {},
     probe: {},
   };
-  let queue: Promise<unknown> = Promise.resolve();
-
-  const AGENTS = {
-    teaching: ["teacher", "practice"],
-    probe: ["prober"],
-  } as const;
+  const AGENTS = { teaching: ["teacher", "practice"], probe: ["prober"] } as const;
   const applyInstructions = () => {
     const next = engine.instructions();
     for (const key of ["teaching", "probe"] as const) {
@@ -227,34 +223,37 @@ export function activate(ctx: PluginBackendContext) {
       slot.off?.();
       slot.off = undefined;
       slot.text = next[key];
-      if (slot.text)
-        slot.off = ctx.registerInstructions({
-          agents: [...AGENTS[key]],
-          text: slot.text,
-        });
+      if (slot.text) slot.off = ctx.registerInstructions({ agents: [...AGENTS[key]], text: slot.text });
     }
   };
-  const refresh = (chatId?: string) => {
-    queue = queue
-      .then(async () => {
-        if (ctx.signal.aborted) return;
-        await engine.scan(chatId);
-        if (ctx.signal.aborted) return;
-        applyInstructions();
-        ctx.events.emit("state-changed");
-      })
-      .catch(() => {});
-    return queue;
+
+  // Every change to engine state runs through one queue, so saves never race.
+  let queue: Promise<unknown> = Promise.resolve();
+  const serial = <T>(work: () => Promise<T>): Promise<T> => {
+    const run = queue.then(() => {
+      if (ctx.signal.aborted) throw new Error("The plugin is shutting down.");
+      return work();
+    });
+    queue = run.catch(() => {});
+    return run;
   };
-  const ready = engine.load().then(() => refresh());
+  const afterChange = () => {
+    applyInstructions();
+    ctx.events.emit("state-changed");
+  };
+  const refresh = (chatId?: string) =>
+    serial(async () => {
+      await engine.scan(chatId);
+      if (!ctx.signal.aborted) afterChange();
+    });
+  const ready = engine.load().then(() => refresh().catch(() => {}));
 
   ctx.events.on((event) => {
-    if (event.type === "turn-settled" || event.type === "record-changed")
-      void refresh(event.chatId);
-    if (event.type === "chats-changed") void refresh();
+    if (event.type === "turn-settled" || event.type === "record-changed") void refresh(event.chatId).catch(() => {});
+    if (event.type === "chats-changed") void refresh().catch(() => {});
   });
   // Notice day changes (new day, rest days, run status) even without activity.
-  const timer = setInterval(() => void refresh(), 60 * 60 * 1000);
+  const timer = setInterval(() => void refresh().catch(() => {}), 60 * 60 * 1000);
   ctx.cleanup(() => {
     clearInterval(timer);
     for (const slot of Object.values(registered)) slot.off?.();
@@ -264,21 +263,29 @@ export function activate(ctx: PluginBackendContext) {
     await ready;
     return engine.summary();
   });
+  ctx.handle("milestoneKnown", async (input: any) => {
+    await ready;
+    return typeof input?.id === "string" && engine.isKnownMilestone(input.id);
+  });
   ctx.handle("setSettings", async (input) => {
     await ready;
-    const summary = await engine.setSettings(input);
-    applyInstructions();
-    return summary;
+    return serial(async () => {
+      const summary = await engine.setSettings(input);
+      afterChange();
+      return summary;
+    });
   });
   ctx.handle("rescan", async () => {
     await ready;
-    for (const entry of Object.values(engine.state.sessions))
-      entry.messageCount = -1;
-    await refresh();
-    return engine.summary();
+    return serial(async () => {
+      for (const entry of Object.values(engine.state.sessions)) entry.messageCount = -1;
+      await engine.scan();
+      afterChange();
+      return engine.summary();
+    });
   });
   ctx.handle("savePlan", async (input) => {
     await ready;
-    return engine.savePlan(input);
+    return serial(() => engine.savePlan(input));
   });
 }

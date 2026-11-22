@@ -163,10 +163,14 @@ export function activate(ctx: PluginFrontendContext) {
   // ── Milestone cards inside lessons ────────────────────────────────────────
   ctx.registerCodeBlock({
     language: MILESTONE_LANGUAGE,
-    mount(container, block) {
+    async mount(container, block) {
       const parsed = parseMilestoneId(block.source);
       const text = parsed && milestoneText(parsed);
-      if (!text) return;
+      if (!text || block.incomplete) return;
+      // Only milestones this plugin actually recorded become cards; the tutor
+      // (or course material steering it) cannot invent one.
+      const known = await call<boolean>("milestoneKnown", { id: block.source.trim() }).catch(() => false);
+      if (!known || block.signal.aborted) return;
       const card = el(
         "div",
         { className: "lh-gam lh-gam-milestone" },
@@ -198,6 +202,10 @@ export function activate(ctx: PluginFrontendContext) {
     async mount(container, signal) {
       const root = el("div", { className: "lh-gam lh-gam-view" });
       container.append(root);
+      // Live sections are rebuilt on each change; the study-plan form is built
+      // once per mount so typing and the download link survive updates.
+      const live = el("div", { className: "lh-gam-live" });
+      let planSection: HTMLElement | undefined;
       let generation = 0;
       const render = async () => {
         const mine = ++generation;
@@ -205,18 +213,16 @@ export function activate(ctx: PluginFrontendContext) {
         try {
           s = await call<Summary>("summary");
         } catch (error) {
-          root.replaceChildren(
-            el("p", { className: "lh-gam-error", text: errorText(error) }),
-          );
+          live.replaceChildren(el("p", { className: "lh-gam-error", text: errorText(error) }));
+          if (!live.isConnected) root.replaceChildren(live);
           return;
         }
         if (signal.aborted || mine !== generation) return;
-        root.replaceChildren(
-          today(s),
-          calendarGrid(s),
-          wins(s),
-          plan(s, signal),
-        );
+        live.replaceChildren(today(s), calendarGrid(s), wins(s));
+        if (!planSection) {
+          planSection = plan(s, signal);
+          root.replaceChildren(live, planSection);
+        }
       };
       renders.add(render);
       signal.addEventListener("abort", () => renders.delete(render), {
@@ -460,6 +466,7 @@ export function activate(ctx: PluginFrontendContext) {
     error?: string;
     canRollBack: boolean;
     restartRequired: boolean;
+    needsAppConfirm?: boolean;
   }
   const renderUpdates = (section: HTMLElement, signal: AbortSignal) => {
     let scope: AbortController | undefined;
@@ -478,7 +485,7 @@ export function activate(ctx: PluginFrontendContext) {
       if (!status) return;
       if (status.mode === "developer") {
         line(
-          `Version ${status.current}. This is a developer install: update it with git and npm run install:local.`,
+          `Version ${status.current}. This is a development build: update it by rebuilding (npm run install:local).`,
         );
         return;
       }
@@ -507,14 +514,30 @@ export function activate(ctx: PluginFrontendContext) {
           notice.append(
             el("p", { className: "lh-gam-notes", text: status.latest.notes }),
           );
-        section.append(notice, actions);
-        button(
+        section.append(notice);
+        // Plugins cannot read the app version; when a release needs a newer
+        // LearnHarness than before, the user confirms it before installing.
+        let confirm: HTMLInputElement | undefined;
+        if (status.needsAppConfirm) {
+          confirm = el("input");
+          confirm.type = "checkbox";
+          section.append(
+            el("label", { className: "lh-gam-confirm" }, confirm,
+              ` I have LearnHarness ${status.latest.minAppVersion} or newer (an older app could not load this update).`),
+          );
+        }
+        section.append(actions);
+        const installButton = button(
           actions,
           "Install update",
-          () => run("installUpdate", "Downloading and verifying the update…"),
+          () => run("installUpdate", "Downloading and verifying the update…", { confirmAppVersion: confirm?.checked === true }),
           sig,
           "default",
         );
+        if (confirm) {
+          installButton.update({ disabled: true });
+          confirm.addEventListener("change", () => installButton.update({ disabled: !confirm!.checked }), { signal: sig });
+        }
       } else {
         if (status.error)
           line(`Could not check for updates: ${status.error}`, "lh-gam-error");
@@ -531,7 +554,7 @@ export function activate(ctx: PluginFrontendContext) {
         sig,
         "outline",
       );
-      if (status.canRollBack)
+      if (status.canRollBack && !status.restartRequired)
         button(
           actions,
           "Roll back to previous version",
