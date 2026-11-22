@@ -1,0 +1,32 @@
+{
+  "name": "learnharness-gamification",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "description": "Learning streaks with rest days, progress view, evidence-based affirmations and study reminders for LearnHarness.",
+  "scripts": {
+    "sdk": "node scripts/setup-sdk.mjs",
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "install:local": "npm run build && node scripts/install-plugin-local.mjs",
+    "keygen": "node scripts/keygen.mjs",
+    "release": "npm run typecheck && npm test && npm run build && node scripts/release.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.12",
+    "typebox": "^1.4.7",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

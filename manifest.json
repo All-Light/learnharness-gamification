@@ -1,0 +1,11 @@
+{
+  "apiVersion": 1,
+  "id": "gamification",
+  "name": "Gamification",
+  "version": "0.2.0",
+  "minAppVersion": "0.7.0",
+  "description": "Learning streaks with rest days, a progress view, encouraging feedback during lessons and study reminders.",
+  "main": "main.js",
+  "backend": "backend.cjs",
+  "styles": "styles.css"
+}
